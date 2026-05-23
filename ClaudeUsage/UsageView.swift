@@ -11,6 +11,7 @@ struct UsageView: View {
         }
         return false
     }()
+    @State private var showingSettings = false
     
     var body: some View {
         VStack(spacing: 0) {
@@ -52,18 +53,21 @@ struct UsageView: View {
 
             Divider()
 
-            if let error = manager.error {
-                errorView(error)
-            } else if let usage = manager.usage {
-                usageContent(usage)
+            if showingSettings {
+                settingsPanel()
             } else {
-                loadingView()
+                if let error = manager.error {
+                    errorView(error)
+                } else if let usage = manager.usage {
+                    usageContent(usage)
+                } else {
+                    loadingView()
+                }
+
+                Divider()
+
+                settingsButton()
             }
-            
-            Divider()
-            
-            // Footer
-            footerView()
         }
         .frame(width: 280)
     }
@@ -89,10 +93,10 @@ struct UsageView: View {
                 color: colorForPercentage(usage.weeklyPercentage)
             )
             
-            // Sonnet only (if available)
+            // Sonnet usage (if available)
             if let sonnetPct = usage.sonnetPercentage {
                 UsageRow(
-                    title: "Sonnet Only",
+                    title: "Sonnet",
                     subtitle: "Model-specific",
                     percentage: sonnetPct,
                     resetsAt: usage.sonnetResetsAt,
@@ -172,7 +176,53 @@ struct UsageView: View {
     }
     
     @ViewBuilder
-    func footerView() -> some View {
+    func settingsButton() -> some View {
+        HStack {
+            Button(action: {
+                Task { await manager.refresh() }
+            }) {
+                Image(systemName: "arrow.clockwise")
+            }
+            .buttonStyle(.borderless)
+            .disabled(manager.isLoading)
+            
+            if let lastUpdated = manager.lastUpdated {
+                Text("Updated \(lastUpdated.formatted(.relative(presentation: .named)))")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+
+            Spacer()
+
+            Button(action: {
+                openURL(URL(string: "https://claude.ai")!)
+            }) {
+                Image(systemName: "globe")
+            }
+            .buttonStyle(.borderless)
+            
+            Button(action: {
+                showingSettings = true
+            }) {
+                Image(systemName: "gearshape")
+            }
+            .buttonStyle(.borderless)
+            
+            Button(action: {
+                NSApplication.shared.terminate(nil)
+            }) {
+                Image(systemName: "xmark.circle")
+            }
+            .buttonStyle(.borderless)
+
+        }
+        .padding(.horizontal)
+        .padding(.vertical, 8)
+        .background(Color(NSColor.controlBackgroundColor))
+    }
+
+    @ViewBuilder
+    func settingsPanel() -> some View {
         VStack(spacing: 8) {
             Button(action: {
                 Task { await manager.checkForUpdates() }
@@ -204,42 +254,39 @@ struct UsageView: View {
 
             Divider()
 
-            HStack {
-                if let lastUpdated = manager.lastUpdated {
-                    Text("Updated \(lastUpdated.formatted(.relative(presentation: .named)))")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
-
-                Spacer()
-
-                Button(action: {
-                    Task { await manager.refresh() }
-                }) {
-                    Image(systemName: "arrow.clockwise")
-                }
-                .buttonStyle(.borderless)
-                .disabled(manager.isLoading)
-
-                Button(action: {
-                    openURL(URL(string: "https://claude.ai")!)
-                }) {
-                    Image(systemName: "globe")
-                }
-                .buttonStyle(.borderless)
-
-                Button(action: {
-                    NSApplication.shared.terminate(nil)
-                }) {
-                    Image(systemName: "xmark.circle")
-                }
-                .buttonStyle(.borderless)
+            Button(action: {
+                openURL(URL(string: "https://x.com/richhickson")!)
+            }) {
+                Text("Created by @richhickson")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
             }
-            .padding(.horizontal)
+            .buttonStyle(.borderless)
 
-            
+            Divider()
+
+            Button(action: {
+                showingSettings = false
+            }) {
+                HStack {
+                    Image(systemName: "xmark")
+                    Text("Close Settings")
+                }
+            }
+            .buttonStyle(.borderless)
+            .font(.caption)
+            .padding(.bottom, 8)
         }
         .background(Color(NSColor.controlBackgroundColor))
+    }
+
+    
+    
+    @ViewBuilder
+    func footerView() -> some View {
+        VStack(spacing: 8) {
+            
+        }
     }
     
     func colorForPercentage(_ pct: Int) -> Color {

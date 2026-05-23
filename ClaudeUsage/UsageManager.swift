@@ -25,7 +25,9 @@ struct UsageData {
 
 private struct UsageSnapshot: Codable {
     let sessionPercentage: Int
+    let sessionResetsAt: Date?
     let weeklyPercentage: Int
+    let weeklyResetsAt: Date?
     let sonnetPercentage: Int?
     let extraUsagePercentage: Int?
     let lastUpdated: Date
@@ -39,7 +41,9 @@ private enum WidgetUsageStore {
         guard let defaults = UserDefaults(suiteName: appGroupIdentifier),
               let data = try? JSONEncoder().encode(UsageSnapshot(
                 sessionPercentage: usage.sessionPercentage,
+                sessionResetsAt: usage.sessionResetsAt,
                 weeklyPercentage: usage.weeklyPercentage,
+                weeklyResetsAt: usage.weeklyResetsAt,
                 sonnetPercentage: usage.sonnetPercentage,
                 extraUsagePercentage: usage.extraUsagePercentage,
                 lastUpdated: lastUpdated
@@ -148,7 +152,7 @@ class UsageManager: ObservableObject {
     @Published var lastUpdated: Date?
     @Published var updateAvailable: String?
 
-    static let currentVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0.0"
+    static let currentVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.8.0"
     static let githubRepo = "richhickson/claudecodeusage"
     static let claudeCodeVersion: String = {
         // Detect installed Claude Code version for User-Agent

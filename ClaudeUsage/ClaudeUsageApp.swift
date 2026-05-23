@@ -161,6 +161,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if popover.isShown {
             popover.performClose(nil)
         } else {
+            popover.contentViewController = NSHostingController(rootView: UsageView(manager: usageManager))
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             
             // Bring to front
