@@ -1,5 +1,6 @@
 import SwiftUI
 import Combine
+import UserNotifications
 
 @main
 struct ClaudeUsageApp: App {
@@ -9,6 +10,16 @@ struct ClaudeUsageApp: App {
         Settings {
             EmptyView()
         }
+    }
+}
+
+extension AppDelegate: UNUserNotificationCenterDelegate {
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.banner, .sound])
     }
 }
 
@@ -24,11 +35,40 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Hide dock icon - menubar only
         NSApp.setActivationPolicy(.accessory)
 
+        setupNotifications()
         setupStatusItem()
         setupPopover()
         setupWakeNotification()
         setupUsageObserver()
         startFetching()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        cleanupMenuBarResources()
+    }
+
+    private func cleanupMenuBarResources() {
+        timer?.invalidate()
+        timer = nil
+
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
+        cancellables.removeAll()
+
+        popover?.performClose(nil)
+        popover = nil
+
+        if let statusItem = statusItem {
+            statusItem.button?.target = nil
+            statusItem.button?.action = nil
+            NSStatusBar.system.removeStatusItem(statusItem)
+            self.statusItem = nil
+        }
+    }
+
+    func setupNotifications() {
+        let center = UNUserNotificationCenter.current()
+        center.delegate = self
+        center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
     }
 
     func setupWakeNotification() {
@@ -76,8 +116,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             await usageManager.checkForUpdates()
         }
 
-        // Refresh every 5 minutes
-        timer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
+        // Refresh every 3 minutes
+        timer = Timer.scheduledTimer(withTimeInterval: 180, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 await self?.usageManager.refresh()
             }

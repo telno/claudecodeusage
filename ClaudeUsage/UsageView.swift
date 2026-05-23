@@ -237,17 +237,7 @@ struct UsageView: View {
             }
             .padding(.horizontal)
 
-            Divider()
-
-            Button(action: {
-                openURL(URL(string: "https://x.com/richhickson")!)
-            }) {
-                Text("Created by @richhickson")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
-            .buttonStyle(.borderless)
-            .padding(.bottom, 8)
+            
         }
         .background(Color(NSColor.controlBackgroundColor))
     }

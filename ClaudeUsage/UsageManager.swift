@@ -1,5 +1,7 @@
 import Foundation
 import Security
+import UserNotifications
+import WidgetKit
 
 struct UsageData {
     let sessionUtilization: Double
@@ -18,6 +20,123 @@ struct UsageData {
     var extraUsagePercentage: Int? {
         guard extraUsageEnabled, let limit = extraUsageMonthlyLimit, let used = extraUsageUsedCredits, limit > 0 else { return nil }
         return Int((used / limit) * 100)
+    }
+}
+
+private struct UsageSnapshot: Codable {
+    let sessionPercentage: Int
+    let weeklyPercentage: Int
+    let sonnetPercentage: Int?
+    let extraUsagePercentage: Int?
+    let lastUpdated: Date
+}
+
+private enum WidgetUsageStore {
+    static let appGroupIdentifier = "group.com.helpfully.ClaudeUsage"
+    static let snapshotKey = "latestUsageSnapshot"
+
+    static func save(_ usage: UsageData, lastUpdated: Date) {
+        guard let defaults = UserDefaults(suiteName: appGroupIdentifier),
+              let data = try? JSONEncoder().encode(UsageSnapshot(
+                sessionPercentage: usage.sessionPercentage,
+                weeklyPercentage: usage.weeklyPercentage,
+                sonnetPercentage: usage.sonnetPercentage,
+                extraUsagePercentage: usage.extraUsagePercentage,
+                lastUpdated: lastUpdated
+              )) else {
+            return
+        }
+
+        defaults.set(data, forKey: snapshotKey)
+        WidgetCenter.shared.reloadTimelines(ofKind: "ClaudeUsageWidgetExtension")
+    }
+}
+
+private enum UsageNotificationKind: String {
+    case session
+    case weekly
+
+    var displayName: String {
+        switch self {
+        case .session: return "Session"
+        case .weekly: return "Weekly"
+        }
+    }
+}
+
+private final class UsageNotificationScheduler {
+    static let shared = UsageNotificationScheduler()
+
+    private let thresholds = [20, 40, 60, 80, 100]
+    private let defaults = UserDefaults.standard
+    private let notificationCenter = UNUserNotificationCenter.current()
+
+    private init() {}
+
+    func evaluate(_ usage: UsageData) {
+        evaluate(kind: .session, percentage: usage.sessionPercentage, resetsAt: usage.sessionResetsAt, usage: usage)
+        evaluate(kind: .weekly, percentage: usage.weeklyPercentage, resetsAt: usage.weeklyResetsAt, usage: usage)
+    }
+
+    private func evaluate(kind: UsageNotificationKind, percentage: Int, resetsAt: Date?, usage: UsageData) {
+        let resetIdentifier = resetsAt.map { String(Int($0.timeIntervalSince1970)) } ?? "unknown"
+        let resetKey = "usageNotification.\(kind.rawValue).resetIdentifier"
+        let thresholdKey = "usageNotification.\(kind.rawValue).lastThreshold"
+
+        if defaults.string(forKey: resetKey) != resetIdentifier {
+            defaults.set(resetIdentifier, forKey: resetKey)
+            defaults.set(0, forKey: thresholdKey)
+        }
+
+        let clampedPercentage = min(max(percentage, 0), 100)
+        guard let threshold = thresholds.last(where: { clampedPercentage >= $0 }) else {
+            defaults.set(0, forKey: thresholdKey)
+            return
+        }
+
+        guard threshold > defaults.integer(forKey: thresholdKey) else { return }
+        defaults.set(threshold, forKey: thresholdKey)
+
+        sendNotification(kind: kind, threshold: threshold, resetIdentifier: resetIdentifier, usage: usage)
+    }
+
+    private func sendNotification(kind: UsageNotificationKind, threshold: Int, resetIdentifier: String, usage: UsageData) {
+        let content = UNMutableNotificationContent()
+        content.title = "\(kind.displayName) usage reached \(threshold)%"
+        content.body = [
+            "Session: \(usage.sessionPercentage)% · resets \(formatTimeRemaining(usage.sessionResetsAt))",
+            "Weekly: \(usage.weeklyPercentage)% · resets \(formatTimeRemaining(usage.weeklyResetsAt))"
+        ].joined(separator: "\n")
+        content.sound = .default
+
+        let request = UNNotificationRequest(
+            identifier: "usage-\(kind.rawValue)-\(threshold)-\(resetIdentifier)",
+            content: content,
+            trigger: nil
+        )
+        notificationCenter.add(request)
+    }
+
+    private func formatTimeRemaining(_ date: Date?) -> String {
+        guard let date = date else { return "unknown" }
+
+        let diff = date.timeIntervalSinceNow
+        if diff <= 0 { return "soon" }
+
+        let hours = Int(diff / 3600)
+        let minutes = Int((diff.truncatingRemainder(dividingBy: 3600)) / 60)
+
+        if hours >= 24 {
+            let days = hours / 24
+            let remainingHours = hours % 24
+            return "in \(days)d \(remainingHours)h"
+        }
+
+        if hours > 0 {
+            return "in \(hours)h \(minutes)m"
+        }
+
+        return "in \(minutes)m"
     }
 }
 
@@ -81,8 +200,11 @@ class UsageManager: ObservableObject {
         do {
             let token = try await getAccessToken()
             let data = try await fetchUsage(token: token)
+            let refreshedAt = Date()
             usage = data
-            lastUpdated = Date()
+            lastUpdated = refreshedAt
+            WidgetUsageStore.save(data, lastUpdated: refreshedAt)
+            UsageNotificationScheduler.shared.evaluate(data)
         } catch let keychainError as KeychainError {
             // Retry on keychain errors that may resolve after unlock
             if retriesRemaining > 0 && keychainError.isRetryable {
