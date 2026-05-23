@@ -56,6 +56,29 @@ private enum WidgetUsageStore {
     }
 }
 
+enum UsageNotificationSettings {
+    static let enabledKey = "usageNotification.enabled"
+    static let thresholdIntervalKey = "usageNotification.thresholdInterval"
+    static let defaultEnabled = true
+    static let defaultThresholdInterval = 20.0
+    static let minimumThresholdInterval = 5.0
+    static let maximumThresholdInterval = 50.0
+    static let thresholdStep = 5.0
+
+    static var isEnabled: Bool {
+        let defaults = UserDefaults.standard
+        guard defaults.object(forKey: enabledKey) != nil else { return defaultEnabled }
+        return defaults.bool(forKey: enabledKey)
+    }
+
+    static var thresholdInterval: Int {
+        let storedValue = UserDefaults.standard.double(forKey: thresholdIntervalKey)
+        let value = storedValue == 0 ? defaultThresholdInterval : storedValue
+        let clampedValue = min(max(value, minimumThresholdInterval), maximumThresholdInterval)
+        return Int(clampedValue.rounded())
+    }
+}
+
 private enum UsageNotificationKind: String {
     case session
     case weekly
@@ -71,13 +94,23 @@ private enum UsageNotificationKind: String {
 private final class UsageNotificationScheduler {
     static let shared = UsageNotificationScheduler()
 
-    private let thresholds = [20, 40, 60, 80, 100]
     private let defaults = UserDefaults.standard
     private let notificationCenter = UNUserNotificationCenter.current()
+
+    private var thresholds: [Int] {
+        let interval = UsageNotificationSettings.thresholdInterval
+        var values = Array(stride(from: interval, through: 100, by: interval))
+        if values.last != 100 {
+            values.append(100)
+        }
+        return values
+    }
 
     private init() {}
 
     func evaluate(_ usage: UsageData) {
+        guard UsageNotificationSettings.isEnabled else { return }
+
         evaluate(kind: .session, percentage: usage.sessionPercentage, resetsAt: usage.sessionResetsAt, usage: usage)
         evaluate(kind: .weekly, percentage: usage.weeklyPercentage, resetsAt: usage.weeklyResetsAt, usage: usage)
     }

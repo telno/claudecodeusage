@@ -12,6 +12,8 @@ struct UsageView: View {
         return false
     }()
     @State private var showingSettings = false
+    @AppStorage(UsageNotificationSettings.enabledKey) private var notificationsEnabled = UsageNotificationSettings.defaultEnabled
+    @AppStorage(UsageNotificationSettings.thresholdIntervalKey) private var notificationThresholdInterval = UsageNotificationSettings.defaultThresholdInterval
     
     var body: some View {
         VStack(spacing: 0) {
@@ -224,6 +226,31 @@ struct UsageView: View {
     @ViewBuilder
     func settingsPanel() -> some View {
         VStack(spacing: 8) {
+            VStack(alignment: .leading, spacing: 8) {
+                Toggle("Usage Notifications", isOn: $notificationsEnabled)
+                    .toggleStyle(.checkbox)
+                    .font(.caption)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("Notify every")
+                        Spacer()
+                        Text("\(Int(notificationThresholdInterval))%")
+                            .foregroundColor(.secondary)
+                    }
+                    .font(.caption)
+
+                    Slider(
+                        value: $notificationThresholdInterval,
+                        in: UsageNotificationSettings.minimumThresholdInterval...UsageNotificationSettings.maximumThresholdInterval,
+                        step: UsageNotificationSettings.thresholdStep
+                    )
+                    .disabled(!notificationsEnabled)
+                }
+            }
+            .padding(.horizontal)
+            .padding(.top, 8)
+
             Button(action: {
                 Task { await manager.checkForUpdates() }
             }) {
@@ -234,7 +261,6 @@ struct UsageView: View {
             }
             .buttonStyle(.borderless)
             .font(.caption)
-            .padding(.top, 8)
 
             Toggle("Launch at Login", isOn: $launchAtLogin)
                 .toggleStyle(.checkbox)
