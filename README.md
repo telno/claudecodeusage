@@ -1,20 +1,42 @@
 # Claude Usage
 
 <p align="center">
-  <img src="Xnapper-2026-01-09-11.22.53.png" alt="Claude Usage Screenshot" width="300">
+  <img src="screenshotSept.png" alt="Claude Usage Screenshot" width="300">
 </p>
 
-A lightweight macOS menubar app that displays your Claude Code usage limits at a glance. 
+A lightweight macOS menubar app that displays your Claude Code usage limits at a glance — and alerts you when a Claude Code session needs your attention.
 <br><Br>
 Built by [@richhickson](https://x.com/richhickson)
 
 ## Features
 
-- 🔄 **Auto-refresh** every 2 minutes
+### Usage tracking
+- 📊 **Session, Weekly & per-model limits** - including model-scoped weekly caps (e.g. Fable/Opus) as Anthropic rolls them out
+- 💵 **Overage tracking** - extra-usage spend against your monthly limit
 - 🚦 **Color-coded status** - Green (OK), Yellow (>70%), Red (>90%)
-- ⏱️ **Time until reset** for both session and weekly limits
-- 📊 **Session & Weekly limits** displayed together
-- 🪶 **Lightweight** - Native Swift, minimal resources
+- 🎨 **Menu bar styles** - Native (monochrome template icon, colors only when a limit runs hot), Tinted (icon colored by usage), or classic Emoji — plus your choice of metric (session/weekly/model %, spend, or icon only)
+- ⏱️ **Time until reset** for each limit
+- 🔄 **Auto-refresh** every 5 minutes, with retry on network/keychain hiccups and refresh on wake from sleep
+- 👥 **Multiple accounts** - every Claude Code login on the machine (one per `CLAUDE_CONFIG_DIR`) gets its own tab, labelled by account email; the menu bar shows the selected one, and the traffic light watches them all
+
+### Session alerts (opt-in)
+- 🔔 **Menu bar bell** naming the project that's waiting for your permission or input (a count when several are)
+- 💬 **macOS notifications** when a session needs you - with an on/off toggle, permission status, and a test button
+- 📋 **Live session list** in the popover: needs you 🔔 / working ⚙️ / finished ✅
+- 🖱️ **Click-to-focus** - click a session (or its notification) to jump to the exact Terminal/iTerm2 tab it's running in; alerts clear once you've visited the session
+
+### Claude status alerts
+- 🌡️ **Outage notifications** - get notified when [status.claude.com](https://status.claude.com) reports a problem, and again when service recovers (checked every 5 minutes; toggle in settings)
+- 🟢 **Status line in the popover** with a severity dot, linking to the status page
+
+### Claude Code settings editor
+- 📝 **Edit your global CLAUDE.md** - tell Claude Code how you like to work, from the app
+- 🗓️ **Conversation retention** - set how long Claude Code keeps local transcripts (`cleanupPeriodDays`), preserving all your other settings
+
+### General
+- ⬆️ **One-click in-app updates** - when a new version ships, click "Update & Relaunch" in the popover; the update's code signature is verified before installing
+- 🚀 **Launch at Login** toggle
+- 🪶 **Lightweight** - Native Swift, minimal resources, no frameworks
 
 ## Installation
 
@@ -54,11 +76,34 @@ Then build with ⌘B and run with ⌘R.
    
 3. Launch Claude Usage - it will read your credentials from Keychain automatically
 
+### Enabling session alerts (optional)
+
+1. Click the menu bar icon → gear icon → toggle **Alert when a session needs attention**
+2. This installs a small status hook into `settings.json` in your Claude Code config dir (pure POSIX sh, no dependencies; your existing settings and hooks are preserved, and toggling off removes it cleanly)
+3. Allow **notifications** when prompted, and allow **"ClaudeUsage wants to control Terminal"** on your first click-to-focus - that's what jumps you to the right terminal tab
+4. Hooks take effect for Claude Code sessions started (or resumed) after enabling
+
+**Tip:** if you use macOS Focus modes, add ClaudeUsage to your Focus allowed apps or banners will be silenced.
+
 ## How It Works
 
 Claude Usage reads your Claude Code OAuth credentials from macOS Keychain and queries the usage API endpoint at `api.anthropic.com/api/oauth/usage`.
 
+Session alerts work via Claude Code's hooks system: a tiny shell script reports each session's status (working / needs attention / finished) to JSON sidecar files in `claudeusage/` inside your Claude Code config dir, which the app watches. Everything stays on your machine.
+
 **Note:** This uses an undocumented API that could change at any time. The app will gracefully handle API changes but may stop working if Anthropic modifies the endpoint.
+
+### Custom config dir (`CLAUDE_CONFIG_DIR`)
+
+Claude Code keeps its config in `~/.claude` unless `CLAUDE_CONFIG_DIR` points elsewhere. When it does, Claude Code also stores its login under its own Keychain entry, `Claude Code-credentials-<8 hex digits>`, rather than `Claude Code-credentials`. Claude Usage follows both: it uses `CLAUDE_CONFIG_DIR` for settings, CLAUDE.md and session alerts, and reads that config dir's Keychain entry first, falling back to the default one.
+
+Apps started from Finder or at login don't see variables set in your shell profile, so Claude Usage also checks the launchd user environment. If you set `CLAUDE_CONFIG_DIR` in your shell, set it there too:
+
+```bash
+launchctl setenv CLAUDE_CONFIG_DIR "$HOME/.config/claude"
+```
+
+Then quit and reopen Claude Usage. The footer of its settings window shows the config dir it is using.
 
 ## Privacy
 

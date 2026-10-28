@@ -3,6 +3,14 @@ import Security
 import UserNotifications
 import WidgetKit
 
+struct ModelLimit {
+    let name: String
+    let utilization: Double
+    let resetsAt: Date?
+
+    var percentage: Int { Int(utilization) }
+}
+
 struct UsageData {
     let sessionUtilization: Double
     let sessionResetsAt: Date?
@@ -10,6 +18,7 @@ struct UsageData {
     let weeklyResetsAt: Date?
     let sonnetUtilization: Double?
     let sonnetResetsAt: Date?
+    let modelLimits: [ModelLimit]
     let extraUsageEnabled: Bool
     let extraUsageMonthlyLimit: Double?
     let extraUsageUsedCredits: Double?
@@ -177,6 +186,33 @@ private final class UsageNotificationScheduler {
     }
 }
 
+/// One Claude Code login found in the Keychain. Each CLAUDE_CONFIG_DIR keeps
+/// its own entry (see ClaudeConfigManager.keychainServices), so a machine can
+/// hold several profiles at once.
+struct ClaudeProfile: Identifiable {
+    let service: String        // Keychain service name
+    var label: String          // account email once known, else a fallback
+    var usage: UsageData?
+    var error: String?
+    var id: String { service }
+
+    /// Short form for the segmented picker (email local part)
+    var shortLabel: String {
+        label.split(separator: "@").first.map(String.init) ?? label
+    }
+}
+
+enum UpdateCheckSettings {
+    static let enabledKey = "updateChecks.enabled"
+    static let defaultEnabled = false
+
+    static var isEnabled: Bool {
+        let defaults = UserDefaults.standard
+        guard defaults.object(forKey: enabledKey) != nil else { return defaultEnabled }
+        return defaults.bool(forKey: enabledKey)
+    }
+}
+
 @MainActor
 class UsageManager: ObservableObject {
     @Published var usage: UsageData?
@@ -184,6 +220,16 @@ class UsageManager: ObservableObject {
     @Published var isLoading = false
     @Published var lastUpdated: Date?
     @Published var updateAvailable: String?
+    @Published var updateDownloadURL: URL?
+
+    /// All Claude Code logins found in the Keychain, active config dir's first.
+    /// With a single profile the app behaves exactly as before.
+    @Published var profiles: [ClaudeProfile] = []
+    @Published private(set) var selectedProfileService: String? =
+        UserDefaults.standard.string(forKey: "selectedProfileService")
+
+    /// Email labels already resolved this run, keyed by Keychain service
+    private var profileLabels: [String: String] = [:]
 
     static let currentVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.8.0"
     static let githubRepo = "richhickson/claudecodeusage"
@@ -216,72 +262,191 @@ class UsageManager: ObservableObject {
         return URLSession(configuration: config)
     }()
 
+    /// Highest utilization across session, weekly, and model-scoped limits —
+    /// over every profile, so a hot limit on another account still shows
+    var maxUtilization: Double {
+        let usages = profiles.isEmpty ? [usage].compactMap { $0 } : profiles.compactMap(\.usage)
+        return usages.map { u in
+            let maxModelUtil = u.modelLimits.map(\.utilization).max() ?? 0
+            return max(u.sessionUtilization, u.weeklyUtilization, maxModelUtil)
+        }.max() ?? 0
+    }
+
     var statusEmoji: String {
-        guard let usage = usage else { return "❓" }
-        let maxUtil = max(usage.sessionUtilization, usage.weeklyUtilization)
-        if maxUtil >= 90 { return "🔴" }
-        if maxUtil >= 70 { return "🟡" }
+        guard usage != nil else { return "❓" }
+        if maxUtilization >= 90 { return "🔴" }
+        if maxUtilization >= 70 { return "🟡" }
         return "🟢"
     }
 
     func refresh() async {
-        await refreshWithRetry(retriesRemaining: 5)
-    }
-
-    private func refreshWithRetry(retriesRemaining: Int, backoffSeconds: UInt64 = 2) async {
         isLoading = true
-        error = nil
-
         defer { isLoading = false }
 
-        do {
-            let token = try await getAccessToken()
-            let data = try await fetchUsage(token: token)
-            let refreshedAt = Date()
-            usage = data
-            lastUpdated = refreshedAt
-            WidgetUsageStore.save(data, lastUpdated: refreshedAt)
-            UsageNotificationScheduler.shared.evaluate(data)
-        } catch let keychainError as KeychainError {
-            // Retry on keychain errors that may resolve after unlock
-            if retriesRemaining > 0 && keychainError.isRetryable {
-                try? await Task.sleep(nanoseconds: 2_000_000_000) // 2 seconds
-                await refreshWithRetry(retriesRemaining: retriesRemaining - 1, backoffSeconds: backoffSeconds)
-                return
+        let preferred = ClaudeConfigManager.keychainServices
+        let services = await Task.detached { Self.discoverKeychainServices(preferred: preferred) }.value
+
+        var newProfiles: [ClaudeProfile] = []
+        for service in services {
+            var profile = ClaudeProfile(service: service,
+                                        label: profileLabels[service] ?? Self.fallbackLabel(service))
+            do {
+                let token = try getClaudeCodeToken(service: service)
+                profile.usage = try await fetchUsageWithRetry(token: token)
+                if profileLabels[service] == nil,
+                   let email = await fetchProfileEmail(token: token) {
+                    profileLabels[service] = email
+                    profile.label = email
+                }
+            } catch let keychainError as KeychainError {
+                // Keychain may not be readable right after boot/wake; retry the
+                // way the old single-profile path did
+                if keychainError.isRetryable,
+                   let data = await retryUsageAfterKeychainDelay(service: service) {
+                    profile.usage = data
+                } else {
+                    profile.error = keychainError.localizedDescription
+                }
+            } catch {
+                profile.error = error.localizedDescription
             }
-            self.error = keychainError.localizedDescription
-        } catch let usageError as UsageError {
-            // Retry on rate limit (429) with exponential backoff
-            if retriesRemaining > 0 && usageError.isRetryable {
-                try? await Task.sleep(nanoseconds: backoffSeconds * 1_000_000_000)
-                await refreshWithRetry(retriesRemaining: retriesRemaining - 1, backoffSeconds: backoffSeconds * 2)
-                return
-            }
-            self.error = usageError.localizedDescription
-        } catch let urlError as URLError {
-            // Retry on network errors (common after wake from sleep)
-            if retriesRemaining > 0 && urlError.isRetryable {
-                try? await Task.sleep(nanoseconds: 3_000_000_000) // 3 seconds for network
-                await refreshWithRetry(retriesRemaining: retriesRemaining - 1, backoffSeconds: backoffSeconds)
-                return
-            }
-            self.error = urlError.localizedDescription
-        } catch {
-            self.error = error.localizedDescription
+            newProfiles.append(profile)
+        }
+
+        newProfiles = Self.collapsed(newProfiles, resolved: profileLabels)
+        profiles = newProfiles
+        if selectedProfileService == nil || !newProfiles.contains(where: { $0.service == selectedProfileService }) {
+            selectedProfileService = newProfiles.first?.service
+        }
+        applySelection()
+        let refreshedAt = Date()
+        lastUpdated = refreshedAt
+        if let usage {
+            WidgetUsageStore.save(usage, lastUpdated: refreshedAt)
+            UsageNotificationScheduler.shared.evaluate(usage)
         }
     }
 
-    private func getAccessToken() async throws -> String {
-        // Get token from Claude Code's keychain via security CLI
-        return try getClaudeCodeToken()
+    /// One tab per account: logins under several config dirs can share an email,
+    /// and abandoned ones never resolve an email or return usage. Keeps the first
+    /// (best-ordered) login per email, and drops dead ones unless nothing else is left.
+    private static func collapsed(_ profiles: [ClaudeProfile], resolved: [String: String]) -> [ClaudeProfile] {
+        var seenEmails = Set<String>()
+        var kept: [ClaudeProfile] = []
+        for profile in profiles {
+            guard let email = resolved[profile.service] else {
+                kept.append(profile)
+                continue
+            }
+            if seenEmails.insert(email).inserted { kept.append(profile) }
+        }
+        let live = kept.filter { $0.usage != nil || resolved[$0.service] != nil }
+        return live.isEmpty ? kept : live
+    }
+
+    /// Switch the popover and menu bar to another profile (no refetch needed)
+    func selectProfile(_ service: String) {
+        guard profiles.contains(where: { $0.service == service }) else { return }
+        selectedProfileService = service
+        UserDefaults.standard.set(service, forKey: "selectedProfileService")
+        applySelection()
+    }
+
+    private func applySelection() {
+        let selected = profiles.first { $0.service == selectedProfileService }
+        usage = selected?.usage
+        error = selected?.error ?? (profiles.isEmpty ? KeychainError.notLoggedIn.localizedDescription : nil)
+    }
+
+    /// Up to 5 keychain retries, 2s apart (post-boot/wake unlock), then usage fetch
+    private func retryUsageAfterKeychainDelay(service: String) async -> UsageData? {
+        for _ in 0..<5 {
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            guard let token = try? getClaudeCodeToken(service: service) else { continue }
+            return try? await fetchUsageWithRetry(token: token)
+        }
+        return nil
+    }
+
+    /// Usage fetch with retry on 429/5xx (exponential backoff) and network errors
+    private func fetchUsageWithRetry(token: String, retriesRemaining: Int = 5, backoffSeconds: UInt64 = 2) async throws -> UsageData {
+        do {
+            return try await fetchUsage(token: token)
+        } catch let usageError as UsageError where retriesRemaining > 0 && usageError.isRetryable {
+            try? await Task.sleep(nanoseconds: backoffSeconds * 1_000_000_000)
+            return try await fetchUsageWithRetry(token: token, retriesRemaining: retriesRemaining - 1, backoffSeconds: backoffSeconds * 2)
+        } catch let urlError as URLError where retriesRemaining > 0 && urlError.isRetryable {
+            try? await Task.sleep(nanoseconds: 3_000_000_000) // 3 seconds for network
+            return try await fetchUsageWithRetry(token: token, retriesRemaining: retriesRemaining - 1, backoffSeconds: backoffSeconds)
+        }
+    }
+
+    /// Scan the Keychain for every Claude Code login. `dump-keychain` lists item
+    /// attributes only (never secrets), so it triggers no ACL prompt.
+    nonisolated private static func discoverKeychainServices(preferred: [String]) -> [String] {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-c",
+            "/usr/bin/security dump-keychain 2>/dev/null | /usr/bin/grep -o '\"svce\"<blob>=\"Claude Code[^\"]*\"'"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+
+        var found = Set<String>()
+        do {
+            try process.run()
+            // Read before waitUntilExit so a large dump can't deadlock the pipe
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            if let out = String(data: data, encoding: .utf8) {
+                for line in out.split(separator: "\n") {
+                    guard let eq = line.range(of: "=\"") else { continue }
+                    let name = String(line[eq.upperBound...].dropLast())
+                    // "Claude Code-credentials" or "Claude Code-credentials-<8hex>"
+                    if name.contains("-credentials") { found.insert(name) }
+                }
+            }
+        } catch {}
+
+        // Active config dir's entry first, then the rest alphabetically
+        var ordered: [String] = []
+        for service in preferred where found.contains(service) {
+            ordered.append(service)
+            found.remove(service)
+        }
+        ordered.append(contentsOf: found.sorted())
+        // Scan found nothing (dump unavailable?) — static list keeps the old path
+        return ordered.isEmpty ? preferred : ordered
+    }
+
+    private static func fallbackLabel(_ service: String) -> String {
+        if service == "Claude Code-credentials" { return "Default" }
+        let suffix = service.replacingOccurrences(of: "Claude Code-credentials-", with: "")
+        return "Profile \(suffix.prefix(8))"
+    }
+
+    /// Account email for a profile tab label, from /api/oauth/profile
+    private func fetchProfileEmail(token: String) async -> String? {
+        var request = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/profile")!)
+        request.httpMethod = "GET"
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("claude-code/\(Self.claudeCodeVersion)", forHTTPHeaderField: "User-Agent")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+
+        guard let (data, response) = try? await urlSession.data(for: request),
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let account = json["account"] as? [String: Any] else { return nil }
+        return account["email"] as? String
     }
 
     /// Get token from Claude Code's keychain using security CLI (avoids ACL prompt!)
-    private func getClaudeCodeToken() throws -> String {
+    private func getClaudeCodeToken(service: String) throws -> String {
         // Use security CLI which is already in the keychain ACL
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        process.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
+        process.arguments = ["find-generic-password", "-s", service, "-w"]
 
         let pipe = Pipe()
         let errorPipe = Pipe()
@@ -402,6 +567,22 @@ class UsageManager: ObservableObject {
         let sonnet = json["seven_day_sonnet"] as? [String: Any] ?? json["sonnet_only"] as? [String: Any]
         let extraUsage = json["extra_usage"] as? [String: Any]
 
+        // Model-scoped limits (e.g. Fable/Opus weekly caps) come from the `limits` array
+        var modelLimits: [ModelLimit] = []
+        if let limits = json["limits"] as? [[String: Any]] {
+            for limit in limits {
+                guard let scope = limit["scope"] as? [String: Any],
+                      let model = scope["model"] as? [String: Any],
+                      let name = model["display_name"] as? String,
+                      let percent = (limit["percent"] as? NSNumber)?.doubleValue else { continue }
+                modelLimits.append(ModelLimit(
+                    name: name,
+                    utilization: percent,
+                    resetsAt: parseDate(limit["resets_at"] as? String)
+                ))
+            }
+        }
+
         return UsageData(
             sessionUtilization: fiveHour?["utilization"] as? Double ?? 0,
             sessionResetsAt: parseDate(fiveHour?["resets_at"] as? String),
@@ -409,6 +590,7 @@ class UsageManager: ObservableObject {
             weeklyResetsAt: parseDate(sevenDay?["resets_at"] as? String),
             sonnetUtilization: sonnet?["utilization"] as? Double,
             sonnetResetsAt: parseDate(sonnet?["resets_at"] as? String),
+            modelLimits: modelLimits,
             extraUsageEnabled: extraUsage?["is_enabled"] as? Bool ?? false,
             extraUsageMonthlyLimit: extraUsage?["monthly_limit"] as? Double,
             extraUsageUsedCredits: extraUsage?["used_credits"] as? Double
@@ -426,7 +608,17 @@ class UsageManager: ObservableObject {
         return formatter.date(from: string)
     }
 
+    func clearUpdate() {
+        updateAvailable = nil
+        updateDownloadURL = nil
+    }
+
     func checkForUpdates() async {
+        guard UpdateCheckSettings.isEnabled else {
+            updateAvailable = nil
+            updateDownloadURL = nil
+            return
+        }
         guard let url = URL(string: "https://api.github.com/repos/\(Self.githubRepo)/releases/latest") else { return }
 
         var request = URLRequest(url: url)
@@ -440,6 +632,12 @@ class UsageManager: ObservableObject {
                 let latestVersion = tagName.trimmingCharacters(in: CharacterSet(charactersIn: "v"))
                 if isNewerVersion(latestVersion, than: Self.currentVersion) {
                     updateAvailable = latestVersion
+                    // Zip asset URL for in-app update
+                    if let assets = json["assets"] as? [[String: Any]],
+                       let zip = assets.first(where: { ($0["name"] as? String) == "ClaudeUsage.zip" }),
+                       let urlString = zip["browser_download_url"] as? String {
+                        updateDownloadURL = URL(string: urlString)
+                    }
                 }
             }
         } catch {

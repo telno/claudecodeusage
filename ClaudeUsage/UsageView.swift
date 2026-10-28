@@ -4,6 +4,9 @@ import ServiceManagement
 
 struct UsageView: View {
     @ObservedObject var manager: UsageManager
+    @ObservedObject var sessionMonitor: SessionMonitor
+    @ObservedObject var statusMonitor: StatusMonitor
+    @ObservedObject var updateInstaller: UpdateInstaller
     @Environment(\.openURL) var openURL
     @State private var launchAtLogin: Bool = {
         if #available(macOS 13.0, *) {
@@ -13,6 +16,11 @@ struct UsageView: View {
     }()
     @State private var showingSettings = false
     @AppStorage(UsageNotificationSettings.enabledKey) private var notificationsEnabled = UsageNotificationSettings.defaultEnabled
+    @AppStorage(UpdateCheckSettings.enabledKey) private var updateChecksEnabled = UpdateCheckSettings.defaultEnabled
+    @StateObject private var config = ClaudeConfigManager()
+    @State private var alertsEnabled = false
+    @State private var menuBarStyle = MenuBarAppearance.style
+    @State private var menuBarMetric = MenuBarAppearance.metric
     @AppStorage(UsageNotificationSettings.thresholdIntervalKey) private var notificationThresholdInterval = UsageNotificationSettings.defaultThresholdInterval
     
     var body: some View {
@@ -38,19 +46,7 @@ struct UsageView: View {
             
             // Update available banner
             if let newVersion = manager.updateAvailable {
-                Button(action: {
-                    openURL(URL(string: "https://github.com/richhickson/claudecodeusage/releases/latest")!)
-                }) {
-                    HStack {
-                        Image(systemName: "arrow.down.circle.fill")
-                        Text("Update Available: v\(newVersion)")
-                    }
-                    .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.green)
-                .padding(.horizontal)
-                .padding(.vertical, 8)
+                updateBanner(newVersion)
             }
 
             Divider()
@@ -58,6 +54,17 @@ struct UsageView: View {
             if showingSettings {
                 settingsPanel()
             } else {
+                // Live Claude Code sessions (when alert hooks are installed)
+                if sessionMonitor.hooksInstalled && !sessionMonitor.sessions.isEmpty {
+                    sessionsSection()
+                    Divider()
+                }
+
+                // Profile tabs (only when several Claude Code logins exist)
+                if manager.profiles.count > 1 {
+                    profilePicker()
+                }
+
                 if let error = manager.error {
                     errorView(error)
                 } else if let usage = manager.usage {
@@ -68,12 +75,34 @@ struct UsageView: View {
 
                 Divider()
 
+                // Claude service status (from status.claude.com)
+                statusRow()
+
+                Divider()
+
                 settingsButton()
             }
         }
         .frame(width: 280)
     }
     
+    @ViewBuilder
+    func profilePicker() -> some View {
+        Picker("", selection: Binding(
+            get: { manager.selectedProfileService ?? "" },
+            set: { manager.selectProfile($0) }
+        )) {
+            ForEach(manager.profiles) { profile in
+                Text(profile.shortLabel).tag(profile.service)
+            }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .help(manager.profiles.map(\.label).joined(separator: " · "))
+        .padding(.horizontal)
+        .padding(.top, 10)
+    }
+
     @ViewBuilder
     func usageContent(_ usage: UsageData) -> some View {
         VStack(spacing: 16) {
@@ -95,6 +124,17 @@ struct UsageView: View {
                 color: colorForPercentage(usage.weeklyPercentage)
             )
             
+            // Model-scoped weekly limits (Fable, Opus, etc.)
+            ForEach(usage.modelLimits, id: \.name) { limit in
+                UsageRow(
+                    title: limit.name,
+                    subtitle: "Model weekly limit",
+                    percentage: limit.percentage,
+                    resetsAt: limit.resetsAt,
+                    color: colorForPercentage(limit.percentage)
+                )
+            }
+
             // Sonnet usage (if available)
             if let sonnetPct = usage.sonnetPercentage {
                 UsageRow(
@@ -118,6 +158,71 @@ struct UsageView: View {
         .padding()
     }
     
+    @ViewBuilder
+    func sessionsSection() -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("CLAUDE SESSIONS")
+                .font(.caption2)
+                .fontWeight(.semibold)
+                .foregroundColor(.secondary)
+
+            ForEach(sessionMonitor.sessions) { session in
+                Button(action: {
+                    AppDelegate.shared?.popover?.performClose(nil)
+                    sessionMonitor.focusSession(session)
+                }) {
+                    HStack(spacing: 8) {
+                        Text(sessionIcon(session))
+                            .font(.caption)
+
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(session.projectName)
+                                .font(.caption)
+                                .fontWeight(.medium)
+                                .lineLimit(1)
+                            Text(sessionLabel(session))
+                                .font(.caption2)
+                                .foregroundColor(session.status == .needsAttention && !session.acknowledged ? .orange : .secondary)
+                                .lineLimit(1)
+                        }
+
+                        Spacer()
+
+                        Text(session.updatedAt.formatted(.relative(presentation: .named)))
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                    .padding(.vertical, 2)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Jump to this session's terminal window")
+            }
+        }
+        .padding(.horizontal)
+        .padding(.vertical, 8)
+    }
+
+    func sessionIcon(_ session: ClaudeSession) -> String {
+        switch session.status {
+        case .needsAttention: return session.acknowledged ? "🔕" : "🔔"
+        case .running: return "⚙️"
+        case .finished: return "✅"
+        }
+    }
+
+    func sessionLabel(_ session: ClaudeSession) -> String {
+        switch session.status {
+        case .needsAttention:
+            if session.acknowledged { return "Waiting (seen)" }
+            return session.message.isEmpty ? "Needs your input" : session.message
+        case .running:
+            return "Working…"
+        case .finished:
+            return "Finished"
+        }
+    }
+
     @ViewBuilder
     func errorView(_ error: String) -> some View {
         VStack(spacing: 12) {
@@ -224,6 +329,101 @@ struct UsageView: View {
     }
 
     @ViewBuilder
+    func updateBanner(_ newVersion: String) -> some View {
+        VStack(spacing: 4) {
+            switch updateInstaller.state {
+            case .idle:
+                if let downloadURL = manager.updateDownloadURL {
+                    Button(action: {
+                        Task { await updateInstaller.installUpdate(from: downloadURL) }
+                    }) {
+                        HStack {
+                            Image(systemName: "arrow.down.circle.fill")
+                            Text("Update to v\(newVersion) & Relaunch")
+                        }
+                        .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.green)
+                } else {
+                    // No zip asset found — fall back to manual download
+                    Button(action: {
+                        openURL(URL(string: "https://github.com/richhickson/claudecodeusage/releases/latest")!)
+                    }) {
+                        HStack {
+                            Image(systemName: "arrow.down.circle.fill")
+                            Text("Update Available: v\(newVersion)")
+                        }
+                        .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.green)
+                }
+            case .downloading:
+                HStack(spacing: 8) {
+                    ProgressView().scaleEffect(0.6)
+                    Text("Downloading v\(newVersion)…").font(.caption)
+                }
+            case .installing:
+                HStack(spacing: 8) {
+                    ProgressView().scaleEffect(0.6)
+                    Text("Verifying & installing…").font(.caption)
+                }
+            case .relaunching:
+                Text("Relaunching…").font(.caption)
+            case .failed(let message):
+                Text("Update failed: \(message)")
+                    .font(.caption)
+                    .foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button("Download manually") {
+                    openURL(URL(string: "https://github.com/richhickson/claudecodeusage/releases/latest")!)
+                }
+                .font(.caption)
+            }
+        }
+        .padding(.horizontal)
+        .padding(.vertical, 8)
+    }
+
+    @ViewBuilder
+    func statusRow() -> some View {
+        if let indicator = statusMonitor.indicator {
+            Button(action: {
+                openURL(URL(string: StatusMonitor.statusPageURL)!)
+            }) {
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(statusColor(indicator))
+                        .frame(width: 8, height: 8)
+                    Text(statusMonitor.statusDescription.isEmpty ? "Claude status" : statusMonitor.statusDescription)
+                        .font(.caption)
+                        .foregroundColor(indicator == "none" ? .secondary : .primary)
+                        .lineLimit(1)
+                    Spacer()
+                    Image(systemName: "arrow.up.right.square")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(statusMonitor.incidentName.isEmpty ? "Open status.claude.com" : statusMonitor.incidentName)
+            .padding(.horizontal)
+            .padding(.vertical, 6)
+        }
+    }
+
+    func statusColor(_ indicator: String) -> Color {
+        switch indicator {
+        case "none": return .green
+        case "minor": return .yellow
+        case "major": return .orange
+        default: return .red // critical
+        }
+    }
+
+    @ViewBuilder
     func settingsPanel() -> some View {
         VStack(spacing: 8) {
             VStack(alignment: .leading, spacing: 8) {
@@ -251,16 +451,16 @@ struct UsageView: View {
             .padding(.horizontal)
             .padding(.top, 8)
 
-            Button(action: {
-                Task { await manager.checkForUpdates() }
-            }) {
-                HStack {
-                    Image(systemName: "arrow.triangle.2.circlepath")
-                    Text("Check for Updates")
+            Toggle("Check for Updates", isOn: $updateChecksEnabled)
+                .toggleStyle(.checkbox)
+                .font(.caption)
+                .padding(.horizontal)
+                .onChange(of: updateChecksEnabled) { enabled in
+                    Task {
+                        if enabled { await manager.checkForUpdates() }
+                        else { manager.clearUpdate() }
+                    }
                 }
-            }
-            .buttonStyle(.borderless)
-            .font(.caption)
 
             Toggle("Launch at Login", isOn: $launchAtLogin)
                 .toggleStyle(.checkbox)
@@ -277,6 +477,10 @@ struct UsageView: View {
                     }
                 }
                 .padding(.horizontal)
+
+            Divider()
+
+            claudeCodeSettings()
 
             Divider()
 
@@ -309,12 +513,125 @@ struct UsageView: View {
     
     
     @ViewBuilder
-    func footerView() -> some View {
-        VStack(spacing: 8) {
-            
+    func claudeCodeSettings() -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Picker("Menu bar", selection: $menuBarStyle) {
+                ForEach(MenuBarStyle.allCases) { style in
+                    Text(style.label).tag(style)
+                }
+            }
+            .font(.caption)
+            .onChange(of: menuBarStyle) { newValue in
+                MenuBarAppearance.style = newValue
+                AppDelegate.shared?.updateStatusItem()
+            }
+
+            Picker("Show", selection: $menuBarMetric) {
+                ForEach(MenuBarMetric.allCases) { metric in
+                    Text(metric.label).tag(metric)
+                }
+            }
+            .font(.caption)
+            .onChange(of: menuBarMetric) { newValue in
+                MenuBarAppearance.metric = newValue
+                AppDelegate.shared?.updateStatusItem()
+            }
+
+            Divider()
+
+            Toggle("Alert when a session needs attention", isOn: $alertsEnabled)
+                .toggleStyle(.checkbox)
+                .font(.caption)
+                .onChange(of: alertsEnabled) { newValue in
+                    guard newValue != sessionMonitor.hooksInstalled else { return }
+                    do {
+                        try sessionMonitor.setEnabled(newValue)
+                        config.statusMessage = nil
+                    } catch {
+                        alertsEnabled = !newValue
+                        config.statusMessage = "Failed: \(error.localizedDescription)"
+                    }
+                }
+
+            Toggle("Show session pop-ups", isOn: Binding(
+                get: { sessionMonitor.popupNotificationsEnabled },
+                set: { sessionMonitor.popupNotificationsEnabled = $0 }
+            ))
+            .toggleStyle(.checkbox)
+            .font(.caption)
+            .disabled(!alertsEnabled)
+
+            if alertsEnabled {
+                switch sessionMonitor.notificationsAuthorized {
+                case false:
+                    Button("Notifications off in System Settings…") {
+                        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.notifications")!)
+                    }
+                    .buttonStyle(.borderless)
+                    .font(.caption)
+                    .foregroundColor(.orange)
+                case nil:
+                    Button("Request notification permission") {
+                        sessionMonitor.requestNotificationPermission()
+                    }
+                    .buttonStyle(.borderless)
+                    .font(.caption)
+                default:
+                    Button("Send test notification") {
+                        sessionMonitor.sendTestNotification()
+                    }
+                    .buttonStyle(.borderless)
+                    .font(.caption)
+                }
+            }
+
+            Toggle("Alert when Claude status changes", isOn: Binding(
+                get: { statusMonitor.alertsEnabled },
+                set: { statusMonitor.alertsEnabled = $0 }
+            ))
+            .toggleStyle(.checkbox)
+            .font(.caption)
+
+            Divider()
+
+            HStack {
+                Text("Keep conversations")
+                Spacer()
+                TextField("30", text: $config.cleanupPeriodDays)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 44)
+                    .multilineTextAlignment(.trailing)
+                    .onSubmit { config.saveCleanupPeriod() }
+                Text("days")
+                    .foregroundColor(.secondary)
+            }
+            .font(.caption)
+
+            Button(action: {
+                NSWorkspace.shared.open(config.claudeMdURL)
+            }) {
+                HStack {
+                    Image(systemName: "doc.text")
+                    Text("Edit CLAUDE.md")
+                }
+            }
+            .buttonStyle(.borderless)
+            .font(.caption)
+
+            if let status = config.statusMessage {
+                Text(status)
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+        }
+        .padding(.horizontal)
+        .onAppear {
+            config.load()
+            alertsEnabled = sessionMonitor.hooksInstalled
+            sessionMonitor.refreshNotificationAuthStatus()
         }
     }
-    
+
     func colorForPercentage(_ pct: Int) -> Color {
         if pct >= 90 { return .red }
         if pct >= 70 { return .orange }
@@ -468,5 +785,5 @@ struct OverageRow: View {
 }
 
 #Preview {
-    UsageView(manager: UsageManager())
+    UsageView(manager: UsageManager(), sessionMonitor: SessionMonitor(), statusMonitor: StatusMonitor(), updateInstaller: UpdateInstaller())
 }
